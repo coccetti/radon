@@ -1,0 +1,7 @@
+- I use the file data_test/CR39-Scanner.txt for imageJ.
+- I run this macro in the data_test folder, with all the jpg images inside the folder 
+to find for each image the number of dacays of radon.
+- at the moment the analysis is really dumb
+- I want to use a neural network
+- looking at the macro and at the jpg files, can you suggest a smart analysis using neural network ?
+- for instance some unsupervised learning ?
