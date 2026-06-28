@@ -129,6 +129,489 @@ def resolve_visual_roi_image(cfg: "Config", image_names: list[str]) -> str | Non
 
 
 # =====================================================================
+# CREF per-image enrichment and cross-group summaries
+# =====================================================================
+GMM_COUNT_COLS = ["imagej_count", "gmm_count", "gmm_ws_count", "gmm_ws_clean_count"]
+RADON_COUNT_COLS = ["imagej_count", "macro_repro", "improved", "nn_clean_count"]
+
+CREF_SUMMARY_SPECS: list[tuple[str, list[str]]] = [
+    ("grand_total", []),
+    ("by_period", ["period"]),
+    ("by_lab_period", ["lab", "period"]),
+    ("by_lab", ["lab"]),
+    ("by_position_group", ["position_group"]),
+    ("by_lab_period_position", ["lab", "period", "position_group"]),
+    ("by_lab_position", ["lab", "position_group"]),
+    ("by_period_position", ["period", "position_group"]),
+]
+
+
+def enrich_with_cref_metadata(df: pd.DataFrame, image_col: str = "image") -> pd.DataFrame:
+    """Add lab, period, position, position_group, base parsed from CREF filenames."""
+    out = df.copy()
+    records = []
+    for name in out[image_col].astype(str):
+        meta = parse_cref_filename(name)
+        if meta is None:
+            records.append({
+                "lab": None,
+                "period": None,
+                "period_num": None,
+                "position": None,
+                "position_group": None,
+                "base": None,
+            })
+        else:
+            records.append({
+                "lab": meta.lab,
+                "period": meta.period,
+                "period_num": int(meta.period[1]),
+                "position": meta.position,
+                "position_group": meta.position[0],
+                "base": meta.base,
+            })
+    meta_df = pd.DataFrame(records)
+    for col in meta_df.columns:
+        out[col] = meta_df[col].values
+
+    meta_cols = ["lab", "period", "period_num", "position", "position_group", "base"]
+    other_cols = [c for c in out.columns if c not in meta_cols]
+    if image_col in other_cols:
+        idx = other_cols.index(image_col) + 1
+        ordered = other_cols[:idx] + meta_cols + [c for c in other_cols[idx:] if c not in meta_cols]
+    else:
+        ordered = other_cols + meta_cols
+    return out[ordered]
+
+
+def aggregate_cref_counts(
+    df: pd.DataFrame,
+    group_cols: list[str],
+    count_cols: list[str],
+) -> pd.DataFrame:
+    """Aggregate count columns by group; returns n_images, sum_*, mean_* per group."""
+    count_cols = [c for c in count_cols if c in df.columns]
+    numeric = df[count_cols].apply(pd.to_numeric, errors="coerce")
+
+    if not group_cols:
+        row: dict = {"n_images": len(df)}
+        for col in count_cols:
+            row[f"sum_{col}"] = numeric[col].sum()
+            row[f"mean_{col}"] = numeric[col].mean()
+        return pd.DataFrame([row])
+
+    work = df[group_cols].copy()
+    for col in count_cols:
+        work[col] = numeric[col].values
+    grouped = work.groupby(group_cols, dropna=False)
+    parts = [grouped.size().rename("n_images")]
+    for col in count_cols:
+        parts.append(grouped[col].sum().rename(f"sum_{col}"))
+        parts.append(grouped[col].mean().rename(f"mean_{col}"))
+    return pd.concat(parts, axis=1).reset_index()
+
+
+def build_cref_summaries(df: pd.DataFrame, count_cols: list[str]) -> dict[str, pd.DataFrame]:
+    """Build all standard CREF grouping summary tables."""
+    return {
+        key: aggregate_cref_counts(df, group_cols, count_cols)
+        for key, group_cols in CREF_SUMMARY_SPECS
+    }
+
+
+def save_cref_summaries(
+    summaries: dict[str, pd.DataFrame],
+    output_dir: Path,
+    prefix: str = "",
+) -> Path:
+    """Write summary tables to output_dir/summaries/{prefix}_*.csv."""
+    summary_dir = output_dir / "summaries"
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    for key, table in summaries.items():
+        name = f"{prefix}_{key}.csv" if prefix else f"{key}.csv"
+        table.to_csv(summary_dir / name, index=False)
+    return summary_dir
+
+
+def pivot_lab_period(df: pd.DataFrame, value_col: str) -> pd.DataFrame:
+    """Pivot lab x period matrix (sums) for heatmaps."""
+    if value_col not in df.columns:
+        raise ValueError(f"Column {value_col!r} not in dataframe")
+    work = df.copy()
+    work[value_col] = pd.to_numeric(work[value_col], errors="coerce")
+    return work.pivot_table(
+        index="lab",
+        columns="period",
+        values=value_col,
+        aggfunc="sum",
+        fill_value=0,
+    )
+
+
+POSITION_GROUPS = ("A", "B", "C")
+POSITION_SLOTS = (1, 2, 3, 4, 5)
+
+
+def position_slot_matrix(
+    df: pd.DataFrame,
+    lab: str,
+    period: str,
+    value_col: str,
+) -> pd.DataFrame:
+    """3×5 matrix (position_group × slot) for one lab-period tile."""
+    if value_col not in df.columns:
+        raise ValueError(f"Column {value_col!r} not in dataframe")
+    sub = df[(df["lab"] == lab) & (df["period"] == period)].copy()
+    if sub.empty:
+        return pd.DataFrame(
+            np.nan,
+            index=list(POSITION_GROUPS),
+            columns=list(POSITION_SLOTS),
+        )
+    if "position_slot" not in sub.columns:
+        sub["position_slot"] = sub["position"].astype(str).str[1:].astype(int)
+    if "position_group" not in sub.columns:
+        sub["position_group"] = sub["position"].astype(str).str[0]
+    sub[value_col] = pd.to_numeric(sub[value_col], errors="coerce")
+    pivot = sub.pivot_table(
+        index="position_group",
+        columns="position_slot",
+        values=value_col,
+        aggfunc="sum",
+    )
+    return pivot.reindex(index=list(POSITION_GROUPS), columns=list(POSITION_SLOTS))
+
+
+def plot_lab_period_position_heatmaps(
+    df: pd.DataFrame,
+    value_col: str,
+    title: str,
+    save_path: Path | None = None,
+    vmin: float | None = None,
+    vmax: float | None = None,
+    cmap: str = "viridis",
+    tile_stats: pd.DataFrame | None = None,
+    tile_stats_col: str = "std",
+    inner_grid: bool = False,
+):
+    """Mosaic: lab × period tiles, each tile a 3×5 position heatmap."""
+    work = df.copy()
+    work[value_col] = pd.to_numeric(work[value_col], errors="coerce")
+    labs = sorted(work["lab"].dropna().unique())
+    periods = sorted(work["period"].dropna().unique())
+    if vmin is None:
+        vmin = float(work[value_col].min())
+    if vmax is None:
+        vmax = float(work[value_col].max())
+
+    stats_lookup: dict[tuple[str, str], float] = {}
+    if tile_stats is not None and {"lab", "period", tile_stats_col}.issubset(tile_stats.columns):
+        for row in tile_stats.itertuples(index=False):
+            stats_lookup[(str(row.lab), str(row.period))] = float(getattr(row, tile_stats_col))
+
+    n_labs, n_periods = len(labs), len(periods)
+    fig, axes = plt.subplots(
+        n_labs,
+        n_periods,
+        figsize=(2.8 * n_periods, 2.6 * n_labs),
+        squeeze=False,
+        constrained_layout=True,
+    )
+    try:
+        plot_cmap = plt.colormaps[cmap].copy()
+    except KeyError:
+        import seaborn as sns
+
+        plot_cmap = sns.color_palette(cmap, as_cmap=True)
+    plot_cmap.set_bad(color="#e0e0e0")
+
+    last_im = None
+    for i, lab in enumerate(labs):
+        for j, period in enumerate(periods):
+            ax = axes[i, j]
+            mat = position_slot_matrix(work, lab, period, value_col)
+            last_im = ax.imshow(
+                mat.values,
+                aspect="auto",
+                cmap=plot_cmap,
+                vmin=vmin,
+                vmax=vmax,
+            )
+            if inner_grid:
+                ax.set_xticks(np.arange(-0.5, len(POSITION_SLOTS), 1), minor=True)
+                ax.set_yticks(np.arange(-0.5, len(POSITION_GROUPS), 1), minor=True)
+                ax.grid(which="minor", color="white", linewidth=0.9, alpha=0.65)
+                ax.tick_params(which="minor", bottom=False, left=False)
+            tile_title = f"{lab} {period}"
+            sigma = stats_lookup.get((lab, period))
+            if sigma is not None and np.isfinite(sigma):
+                tile_title += f"\nσ={sigma:.1f}"
+            ax.set_title(tile_title, fontsize=8)
+            if j == 0:
+                ax.set_yticks(range(len(POSITION_GROUPS)), labels=POSITION_GROUPS)
+            else:
+                ax.set_yticks([])
+            if i == n_labs - 1:
+                ax.set_xticks(range(len(POSITION_SLOTS)), labels=POSITION_SLOTS)
+                ax.set_xlabel("slot")
+            else:
+                ax.set_xticks([])
+
+    fig.suptitle(f"{title} — position detail (A/B/C × 1–5)", fontsize=12, y=1.02)
+    if last_im is not None:
+        fig.colorbar(last_im, ax=axes.ravel().tolist(), fraction=0.02, pad=0.02)
+    if save_path is not None:
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    return fig
+
+
+def add_within_tile_centered(
+    df: pd.DataFrame,
+    value_col: str,
+    mode: str = "dev",
+    group_cols: tuple[str, ...] = ("lab", "period"),
+) -> tuple[pd.DataFrame, str]:
+    """Add per-image column centered within each lab×period tile.
+
+    mode: ``dev`` (raw count − tile mean), ``zscore``, ``pct`` (percent of tile mean).
+    """
+    if value_col not in df.columns:
+        raise ValueError(f"Column {value_col!r} not in dataframe")
+    if mode not in {"dev", "zscore", "pct"}:
+        raise ValueError(f"mode must be 'dev', 'zscore', or 'pct'; got {mode!r}")
+
+    work = df.copy()
+    work[value_col] = pd.to_numeric(work[value_col], errors="coerce")
+    grouped = work.groupby(list(group_cols), dropna=False)[value_col]
+    tile_mean = grouped.transform("mean")
+    suffix = {"dev": "tile_dev", "zscore": "tile_z", "pct": "tile_pct_dev"}[mode]
+    out_col = f"{value_col}_{suffix}"
+
+    if mode == "dev":
+        work[out_col] = work[value_col] - tile_mean
+    elif mode == "zscore":
+        tile_std = grouped.transform("std")
+        work[out_col] = (work[value_col] - tile_mean) / tile_std
+    else:
+        work[out_col] = np.where(
+            tile_mean != 0,
+            100.0 * (work[value_col] - tile_mean) / tile_mean,
+            np.nan,
+        )
+    return work, out_col
+
+
+def tile_dispersion_table(
+    df: pd.DataFrame,
+    value_col: str,
+    group_cols: tuple[str, ...] = ("lab", "period"),
+) -> pd.DataFrame:
+    """Per-tile mean, std, variance, and CV across detector positions."""
+    if value_col not in df.columns:
+        raise ValueError(f"Column {value_col!r} not in dataframe")
+    work = df.copy()
+    work[value_col] = pd.to_numeric(work[value_col], errors="coerce")
+    out = (
+        work.groupby(list(group_cols), dropna=False)[value_col]
+        .agg(n="count", mean="mean", std="std", var="var")
+        .reset_index()
+    )
+    out["cv"] = out["std"] / out["mean"]
+    return out
+
+
+def pivot_lab_period_dispersion(
+    df: pd.DataFrame,
+    value_col: str,
+    stat: str = "std",
+    group_cols: tuple[str, ...] = ("lab", "period"),
+) -> pd.DataFrame:
+    """Pivot lab × period matrix of within-tile dispersion (std, var, cv, mean)."""
+    allowed = {"std", "var", "cv", "mean"}
+    if stat not in allowed:
+        raise ValueError(f"stat must be one of {allowed}; got {stat!r}")
+    table = tile_dispersion_table(df, value_col, group_cols=group_cols)
+    pivot = table.pivot(index="lab", columns="period", values=stat)
+    return pivot.reindex(index=sorted(pivot.index), columns=sorted(pivot.columns))
+
+
+def plot_lab_period_scalar_heatmaps(
+    pivot: pd.DataFrame,
+    title: str,
+    save_path: Path | None = None,
+    cmap: str = "mako_r",
+    vmin: float | None = None,
+    vmax: float | None = None,
+    center: float | None = None,
+    annotate_fmt: str = "{:.0f}",
+):
+    """Single-value-per-tile lab × period heatmap with optional cell annotations."""
+    values = pivot.values.astype(float)
+    if vmin is None:
+        vmin = float(np.nanmin(values))
+    if vmax is None:
+        vmax = float(np.nanmax(values))
+
+    fig, ax = plt.subplots(figsize=(2.8 * len(pivot.columns), 0.55 * len(pivot.index) + 2))
+    norm = None
+    if center is not None:
+        from matplotlib.colors import TwoSlopeNorm
+
+        norm = TwoSlopeNorm(vmin=vmin, vcenter=center, vmax=vmax)
+    try:
+        plot_cmap = plt.colormaps[cmap].copy()
+    except KeyError:
+        import seaborn as sns
+
+        plot_cmap = sns.color_palette(cmap, as_cmap=True)
+    plot_cmap.set_bad(color="#e0e0e0")
+    im = ax.imshow(
+        values,
+        aspect="auto",
+        cmap=plot_cmap,
+        vmin=None if norm else vmin,
+        vmax=None if norm else vmax,
+        norm=norm,
+    )
+    ax.set_xticks(range(len(pivot.columns)), labels=pivot.columns)
+    ax.set_yticks(range(len(pivot.index)), labels=pivot.index)
+    ax.set_xlabel("period")
+    ax.set_ylabel("lab")
+    ax.set_title(title)
+
+    for i, lab in enumerate(pivot.index):
+        for j, period in enumerate(pivot.columns):
+            val = pivot.iloc[i, j]
+            if pd.notna(val):
+                mid = center if center is not None else (vmin + vmax) / 2
+                text_color = "white" if val > mid else "black"
+                ax.text(j, i, annotate_fmt.format(val), ha="center", va="center", color=text_color, fontsize=9)
+
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    if save_path is not None:
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    return fig
+
+
+def plot_tile_dispersion_bars(
+    table_a: pd.DataFrame,
+    table_b: pd.DataFrame,
+    stat_col: str,
+    label_a: str,
+    label_b: str,
+    title: str,
+    save_path: Path | None = None,
+):
+    """Grouped bar chart comparing per-tile dispersion between two metrics."""
+    merged = table_a.merge(
+        table_b,
+        on=["lab", "period"],
+        suffixes=("_a", "_b"),
+        how="inner",
+    )
+    merged["tile"] = merged["lab"] + " " + merged["period"]
+    merged = merged.sort_values(["lab", "period"])
+
+    x = np.arange(len(merged))
+    width = 0.38
+    fig, ax = plt.subplots(figsize=(max(12, len(merged) * 0.55), 5))
+    ax.bar(x - width / 2, merged[f"{stat_col}_a"], width, label=label_a, color="#4C72B0")
+    ax.bar(x + width / 2, merged[f"{stat_col}_b"], width, label=label_b, color="#DD8452")
+    ax.set_xticks(x, merged["tile"], rotation=45, ha="right")
+    ax.set_ylabel(stat_col)
+    ax.set_title(title)
+    ax.legend(frameon=False)
+    ax.grid(axis="y", alpha=0.25)
+    fig.tight_layout()
+    if save_path is not None:
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    return fig
+
+
+def plot_deviation_strip(
+    df: pd.DataFrame,
+    dev_col: str,
+    title: str,
+    save_path: Path | None = None,
+    hue_col: str = "position",
+    order: list | None = None,
+):
+    """Strip plot of per-image tile-centered deviations across positions."""
+    import seaborn as sns
+
+    work = df.copy()
+    work[dev_col] = pd.to_numeric(work[dev_col], errors="coerce")
+    if order is None:
+        order = sorted(work[hue_col].dropna().unique(), key=lambda p: (str(p)[0], int(str(p)[1:])))
+
+    fig, ax = plt.subplots(figsize=(14, 5))
+    sns.stripplot(
+        data=work,
+        x=hue_col,
+        y=dev_col,
+        order=order,
+        hue="lab",
+        dodge=False,
+        alpha=0.55,
+        jitter=0.25,
+        size=4,
+        ax=ax,
+    )
+    ax.axhline(0, color="0.3", linewidth=1, linestyle="--")
+    ax.set_xlabel("detector position")
+    ax.set_ylabel(dev_col)
+    ax.set_title(title)
+    ax.tick_params(axis="x", rotation=45)
+    ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", frameon=False, title="lab")
+    fig.tight_layout()
+    if save_path is not None:
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    return fig
+
+
+def export_gmm_cref_results(
+    per_image_df: pd.DataFrame,
+    output_dir: Path,
+    inventory_total: int | None = None,
+) -> pd.DataFrame:
+    """Enrich, save per-image master CSV, count comparison, and GMM summaries."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    enriched = enrich_with_cref_metadata(per_image_df)
+    enriched.to_csv(output_dir / "gmm_per_image_cref.csv", index=False)
+    enriched.to_csv(output_dir / "gmm_count_comparison.csv", index=False)
+    summaries = build_cref_summaries(enriched, GMM_COUNT_COLS)
+    save_cref_summaries(summaries, output_dir, prefix="gmm")
+    n = len(enriched)
+    if inventory_total is not None and n != inventory_total:
+        print(f"Note: {n} images analyzed ({inventory_total} in full CREF inventory).")
+    print(f"Saved gmm_per_image_cref.csv ({n} rows) and summaries/gmm_*.csv")
+    return enriched
+
+
+def export_radon_cref_results(
+    per_image_df: pd.DataFrame,
+    output_dir: Path,
+    inventory_total: int | None = None,
+) -> pd.DataFrame:
+    """Enrich, save per-image master CSV and radon summaries."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    enriched = enrich_with_cref_metadata(per_image_df)
+    enriched.to_csv(output_dir / "radon_per_image_cref.csv", index=False)
+    summaries = build_cref_summaries(enriched, RADON_COUNT_COLS)
+    save_cref_summaries(summaries, output_dir, prefix="radon")
+    n = len(enriched)
+    if inventory_total is not None and n != inventory_total:
+        print(f"Note: {n} images analyzed ({inventory_total} in full CREF inventory).")
+    print(f"Saved radon_per_image_cref.csv ({n} rows) and summaries/radon_*.csv")
+    return enriched
+
+
+# =====================================================================
 # Configuration and Hyperparameters
 # =====================================================================
 @dataclass
@@ -803,7 +1286,9 @@ def main():
 
     macro_map = load_macro_counts(cfg.macro_summary)
     final_df = build_count_comparison(macro_map, meta_gmm, meta_ws, artifact_clusters)
-    final_df.to_csv(cfg.output_dir / "gmm_count_comparison.csv", index=False)
+    final_df = export_gmm_cref_results(
+        final_df, cfg.output_dir, inventory_total=inventory["total_files"]
+    )
     save_count_comparison_plots(final_df, cfg.output_dir)
 
     roi_lookup = {reg["path"].name: reg["roi"] for reg in image_registry}
